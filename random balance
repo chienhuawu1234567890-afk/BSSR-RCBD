@@ -1,0 +1,224 @@
+############################################################
+# Balanced RCBD with Random Blocks
+# Sample size re-estimation simulation
+############################################################
+
+set.seed(123)
+
+library(dplyr)
+
+# -----------------------------
+# 1. Settings
+# -----------------------------
+
+nsim <- 5000
+
+g <- 4
+b <- 6
+alpha <- 0.05
+target_power <- 0.80
+
+theta_vec  <- c(0.25, 0.50, 0.75)
+sigma2_vec <- c(2, 4, 6)
+
+sigma2_B <- 4   # random block variance
+
+mu <- 10
+
+tau_plan <- c(-1.5, -0.5, 0.5, 1.5)
+
+# -----------------------------
+# 2. Power function for RCBD
+# -----------------------------
+
+rcbd_power <- function(n0, g, b, tau, sigma2, alpha = 0.05) {
+  
+  df1 <- g - 1
+  df2 <- g * b * n0 - g - b + 1
+  
+  lambda <- b * n0 * sum(tau^2) / sigma2
+  
+  fcrit <- qf(1 - alpha, df1, df2)
+  
+  power <- 1 - pf(fcrit, df1, df2, ncp = lambda)
+  
+  return(power)
+}
+
+# -----------------------------
+# 3. Find required sample size
+# -----------------------------
+
+find_n0 <- function(g, b, tau, sigma2, alpha, target_power) {
+  
+  n0 <- 1
+  
+  while (rcbd_power(n0, g, b, tau, sigma2, alpha) < target_power) {
+    n0 <- n0 + 1
+  }
+  
+  return(n0)
+}
+
+# -----------------------------
+# 4. Generate balanced random-block RCBD data
+# -----------------------------
+
+generate_data <- function(g, b, n0, mu, tau, sigma2, sigma2_B) {
+  
+  dat <- expand.grid(
+    trt   = factor(1:g),
+    block = factor(1:b),
+    rep   = 1:n0
+  )
+  
+  # random block effects
+  B <- rnorm(b, mean = 0, sd = sqrt(sigma2_B))
+  
+  dat$B <- B[as.numeric(dat$block)]
+  
+  dat$Y <- mu +
+    tau[as.numeric(dat$trt)] +
+    dat$B +
+    rnorm(nrow(dat), mean = 0, sd = sqrt(sigma2))
+  
+  return(dat)
+}
+
+# -----------------------------
+# 5. Re-estimate sample size
+# -----------------------------
+
+reestimate_n0 <- function(g, b, tau, sigma2_hat, alpha, target_power) {
+  
+  sigma2_hat <- max(sigma2_hat, 1e-8)
+  
+  n0_new <- find_n0(
+    g = g,
+    b = b,
+    tau = tau,
+    sigma2 = sigma2_hat,
+    alpha = alpha,
+    target_power = target_power
+  )
+  
+  return(n0_new)
+}
+
+# -----------------------------
+# 6. Main simulation
+# -----------------------------
+
+all_results <- list()
+
+counter <- 1
+
+for (theta in theta_vec) {
+  for (sigma2_true in sigma2_vec) {
+    
+    n0_plan <- find_n0(
+      g = g,
+      b = b,
+      tau = tau_plan,
+      sigma2 = sigma2_true,
+      alpha = alpha,
+      target_power = target_power
+    )
+    
+    N_plan <- g * b * n0_plan
+    
+    n0_interim <- max(1, floor(theta * n0_plan))
+    N_interim  <- g * b * n0_interim
+    
+    N_naive    <- numeric(nsim)
+    N_unblind  <- numeric(nsim)
+    N_adjusted <- numeric(nsim)
+    
+    for (s in 1:nsim) {
+      
+      dat <- generate_data(
+        g = g,
+        b = b,
+        n0 = n0_interim,
+        mu = mu,
+        tau = tau_plan,
+        sigma2 = sigma2_true,
+        sigma2_B = sigma2_B
+      )
+      
+      # Total sum of squares
+      SSTO <- sum((dat$Y - mean(dat$Y))^2)
+      
+      # Naive blinded estimator
+      sigma2_naive <- SSTO / (N_interim - 1)
+      
+      # Unblinded estimator from RCBD model
+      fit <- aov(Y ~ trt + block, data = dat)
+      tab <- summary(fit)[[1]]
+      sigma2_unblind <- tab["Residuals", "Mean Sq"]
+      
+      # Adjusted blinded estimator for random blocks
+      # E(SSTO) includes treatment variation and random block variation
+      Q_tau <- b * n0_interim * sum(tau_plan^2)
+      
+      Q_block_expected <- g * n0_interim * (b - 1) * sigma2_B
+      
+      sigma2_adjusted <- 
+        (SSTO - Q_tau - Q_block_expected) / (N_interim - 1)
+      
+      sigma2_adjusted <- max(sigma2_adjusted, 1e-8)
+      
+      # Re-estimated total sample sizes
+      N_naive[s] <- g * b * reestimate_n0(
+        g, b, tau_plan, sigma2_naive, alpha, target_power
+      )
+      
+      N_unblind[s] <- g * b * reestimate_n0(
+        g, b, tau_plan, sigma2_unblind, alpha, target_power
+      )
+      
+      N_adjusted[s] <- g * b * reestimate_n0(
+        g, b, tau_plan, sigma2_adjusted, alpha, target_power
+      )
+    }
+    
+    temp <- data.frame(
+      theta = theta,
+      sigma2 = sigma2_true,
+      sigma2_B = sigma2_B,
+      Method = rep(
+        c("Naive blinded", "Unblinded", "Adjusted blinded"),
+        each = nsim
+      ),
+      SampleSize = c(N_naive, N_unblind, N_adjusted)
+    )
+    
+    all_results[[counter]] <- temp
+    counter <- counter + 1
+  }
+}
+
+sim_results <- bind_rows(all_results)
+
+# -----------------------------
+# 7. Summary table
+# -----------------------------
+
+summary_table <- sim_results %>%
+  group_by(theta, sigma2, sigma2_B, Method) %>%
+  summarise(
+    Mean   = mean(SampleSize),
+    SD     = sd(SampleSize),
+    Median = median(SampleSize),
+    `2.5%` = quantile(SampleSize, 0.025),
+    `97.5%` = quantile(SampleSize, 0.975),
+    .groups = "drop"
+  )
+
+print(summary_table)
+
+write.csv(
+  summary_table,
+  "balanced_random_block_sample_size_results.csv",
+  row.names = FALSE
+)
