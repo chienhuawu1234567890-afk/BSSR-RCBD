@@ -1,0 +1,275 @@
+############################################################
+# Unbalanced RCBD with Random Blocks
+# Sample size re-estimation simulation
+############################################################
+
+set.seed(123)
+
+library(dplyr)
+
+# -----------------------------
+# 1. Settings
+# -----------------------------
+
+nsim <- 5000
+
+g <- 4
+b <- 6
+alpha <- 0.05
+target_power <- 0.80
+
+theta_vec  <- c(0.25, 0.50, 0.75)
+sigma2_vec <- c(2, 4, 6)
+
+sigma2_B <- 4   # random block variance
+
+mu <- 10
+
+# Planned treatment effects
+tau_plan <- c(-1.5, -0.5, 0.5, 1.5)
+
+# Unbalanced allocation ratios
+# Example: n2 = 1*n1, n3 = 3*n1, n4 = 3*n1
+ratio <- c(1, 1, 3, 3)
+
+# -----------------------------
+# 2. Power function for unbalanced RCBD
+# -----------------------------
+
+rcbd_power_unbalanced <- function(n1, g, b, tau, ratio, sigma2, alpha = 0.05) {
+  
+  n_vec <- ratio * n1
+  N <- b * sum(n_vec)
+  
+  df1 <- g - 1
+  df2 <- N - g - b + 1
+  
+  # Weighted treatment mean
+  tau_bar_w <- sum(n_vec * tau) / sum(n_vec)
+  
+  # Noncentrality parameter for unbalanced treatment allocation
+  lambda <- b * sum(n_vec * (tau - tau_bar_w)^2) / sigma2
+  
+  fcrit <- qf(1 - alpha, df1, df2)
+  
+  power <- 1 - pf(fcrit, df1, df2, ncp = lambda)
+  
+  return(power)
+}
+
+# -----------------------------
+# 3. Find required baseline n1
+# -----------------------------
+
+find_n1 <- function(g, b, tau, ratio, sigma2, alpha, target_power) {
+  
+  n1 <- 1
+  
+  while (
+    rcbd_power_unbalanced(
+      n1 = n1,
+      g = g,
+      b = b,
+      tau = tau,
+      ratio = ratio,
+      sigma2 = sigma2,
+      alpha = alpha
+    ) < target_power
+  ) {
+    n1 <- n1 + 1
+  }
+  
+  return(n1)
+}
+
+# -----------------------------
+# 4. Generate unbalanced random-block RCBD data
+# -----------------------------
+
+generate_data_unbalanced <- function(g, b, n1, ratio, mu, tau, sigma2, sigma2_B) {
+  
+  n_vec <- ratio * n1
+  
+  dat_list <- list()
+  counter <- 1
+  
+  for (i in 1:g) {
+    for (j in 1:b) {
+      
+      temp <- data.frame(
+        trt   = factor(i),
+        block = factor(j),
+        rep   = 1:n_vec[i]
+      )
+      
+      dat_list[[counter]] <- temp
+      counter <- counter + 1
+    }
+  }
+  
+  dat <- bind_rows(dat_list)
+  
+  # Random block effects
+  B <- rnorm(b, mean = 0, sd = sqrt(sigma2_B))
+  
+  dat$B <- B[as.numeric(dat$block)]
+  
+  dat$Y <- mu +
+    tau[as.numeric(dat$trt)] +
+    dat$B +
+    rnorm(nrow(dat), mean = 0, sd = sqrt(sigma2))
+  
+  return(dat)
+}
+
+# -----------------------------
+# 5. Re-estimate sample size
+# -----------------------------
+
+reestimate_n1 <- function(g, b, tau, ratio, sigma2_hat, alpha, target_power) {
+  
+  sigma2_hat <- max(sigma2_hat, 1e-8)
+  
+  n1_new <- find_n1(
+    g = g,
+    b = b,
+    tau = tau,
+    ratio = ratio,
+    sigma2 = sigma2_hat,
+    alpha = alpha,
+    target_power = target_power
+  )
+  
+  return(n1_new)
+}
+
+# -----------------------------
+# 6. Main simulation
+# -----------------------------
+
+all_results <- list()
+counter <- 1
+
+for (theta in theta_vec) {
+  for (sigma2_true in sigma2_vec) {
+    
+    # Initial planned baseline sample size n1
+    n1_plan <- find_n1(
+      g = g,
+      b = b,
+      tau = tau_plan,
+      ratio = ratio,
+      sigma2 = sigma2_true,
+      alpha = alpha,
+      target_power = target_power
+    )
+    
+    n_vec_plan <- ratio * n1_plan
+    N_plan <- b * sum(n_vec_plan)
+    
+    # Interim baseline sample size
+    n1_interim <- max(1, floor(theta * n1_plan))
+    n_vec_interim <- ratio * n1_interim
+    N_interim <- b * sum(n_vec_interim)
+    
+    N_naive    <- numeric(nsim)
+    N_unblind  <- numeric(nsim)
+    N_adjusted <- numeric(nsim)
+    
+    for (s in 1:nsim) {
+      
+      dat <- generate_data_unbalanced(
+        g = g,
+        b = b,
+        n1 = n1_interim,
+        ratio = ratio,
+        mu = mu,
+        tau = tau_plan,
+        sigma2 = sigma2_true,
+        sigma2_B = sigma2_B
+      )
+      
+      # Total sum of squares
+      SSTO <- sum((dat$Y - mean(dat$Y))^2)
+      
+      # Naive blinded estimator
+      sigma2_naive <- SSTO / (N_interim - 1)
+      
+      # Unblinded residual variance estimator
+      fit <- aov(Y ~ trt + block, data = dat)
+      tab <- summary(fit)[[1]]
+      sigma2_unblind <- tab["Residuals", "Mean Sq"]
+      
+      # Adjusted blinded estimator for random blocks
+      # E(SSTO) includes treatment variation and random block variation
+      
+      tau_bar_w <- sum(n_vec_interim * tau_plan) / sum(n_vec_interim)
+      
+      Q_tau <- b * sum(n_vec_interim * (tau_plan - tau_bar_w)^2)
+      
+      Q_block_expected <- sum(n_vec_interim) * (b - 1) * sigma2_B
+      
+      sigma2_adjusted <- 
+        (SSTO - Q_tau - Q_block_expected) / (N_interim - 1)
+      
+      sigma2_adjusted <- max(sigma2_adjusted, 1e-8)
+      
+      # Re-estimated baseline sample sizes
+      n1_naive <- reestimate_n1(
+        g, b, tau_plan, ratio, sigma2_naive, alpha, target_power
+      )
+      
+      n1_unblind <- reestimate_n1(
+        g, b, tau_plan, ratio, sigma2_unblind, alpha, target_power
+      )
+      
+      n1_adjusted <- reestimate_n1(
+        g, b, tau_plan, ratio, sigma2_adjusted, alpha, target_power
+      )
+      
+      # Convert to total sample size
+      N_naive[s] <- b * sum(ratio * n1_naive)
+      N_unblind[s] <- b * sum(ratio * n1_unblind)
+      N_adjusted[s] <- b * sum(ratio * n1_adjusted)
+    }
+    
+    temp <- data.frame(
+      theta = theta,
+      sigma2 = sigma2_true,
+      sigma2_B = sigma2_B,
+      Method = rep(
+        c("Naive blinded", "Unblinded", "Adjusted blinded"),
+        each = nsim
+      ),
+      SampleSize = c(N_naive, N_unblind, N_adjusted)
+    )
+    
+    all_results[[counter]] <- temp
+    counter <- counter + 1
+  }
+}
+
+sim_results <- bind_rows(all_results)
+
+# -----------------------------
+# 7. Summary table
+# -----------------------------
+
+summary_table <- sim_results %>%
+  group_by(theta, sigma2, sigma2_B, Method) %>%
+  summarise(
+    Mean   = mean(SampleSize),
+    SD     = sd(SampleSize),
+    Median = median(SampleSize),
+    `2.5%` = quantile(SampleSize, 0.025),
+    `97.5%` = quantile(SampleSize, 0.975),
+    .groups = "drop"
+  )
+
+print(summary_table)
+
+write.csv(
+  summary_table,
+  "unbalanced_random_block_sample_size_results.csv",
+  row.names = FALSE
+)
